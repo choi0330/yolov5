@@ -8,165 +8,126 @@ import cv2
 import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
+import numpy as np
 
 from models.experimental import attempt_load
-from utils.datasets import LoadStreams, LoadImages
 from utils.general import (
-    check_img_size, non_max_suppression, apply_classifier, scale_coords,
-    xyxy2xywh, plot_one_box, strip_optimizer, set_logging)
-from utils.torch_utils import select_device, load_classifier, time_synchronized
+    check_img_size, non_max_suppression, scale_coords,
+    xyxy2xywh, set_logging)
+from utils.torch_utils import select_device, time_synchronized
+
+# Original source code: https://github.com/ultralytics/yolov5
+# Customized by Hokwang Choi.
+class DetectorYoloV5:
+    def __init__(self, conf_thres, iou_thres):
+        # The original image size of the trained network.
+        self.imgsz = 640
+        self.weights = 'yolov5s.pt'
+        self.conf_thres = conf_thres
+        self.iou_thres = iou_thres
+        
+        # Initialize the device.
+        set_logging()
+        # GPU device 0 by default.
+        self.device = select_device('')
+        # Half precision only supported on CUDA.
+        self.half = self.device.type != 'cpu'  
+
+        # Load FP32 model.
+        self.model = attempt_load(self.weights, map_location=self.device)
+        # Check img_size.
+        self.checked_imgsz = check_img_size(self.imgsz, s=self.model.stride.max())
+        if self.half:
+            self.model.half()  # to FP16
+
+        # Get class names.
+        self.names = self.model.module.names if hasattr(self.model, 'module') else self.model.names
+
+        # Dry run to prepare GPU.
+        img = torch.zeros((1, 3, self.checked_imgsz, self.checked_imgsz), device=self.device)
+        _ = self.model(img.half() if self.half else img) if self.device.type != 'cpu' else None
 
 
-def detect(save_img=False):
-    out, source, weights, view_img, save_txt, imgsz = \
-        opt.save_dir, opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size
-    webcam = source.isnumeric() or source.startswith(('rtsp://', 'rtmp://', 'http://')) or source.endswith('.txt')
+    def detect(self, sub_image = None):
+        img_raw = sub_image # BGR
+        assert img_raw is not None, 'Image is not valid.'
+        
+        # Padded resize.
+        img_test = self.letterbox(img_raw, new_shape=self.checked_imgsz)[0]
 
-    # Initialize
-    set_logging()
-    device = select_device(opt.device)
-    if os.path.exists(out):  # output dir
-        shutil.rmtree(out)  # delete dir
-    os.makedirs(out)  # make new dir
-    half = device.type != 'cpu'  # half precision only supported on CUDA
+        # Convert image to fit the input layer.
+        img_test = img_test[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img_test = np.ascontiguousarray(img_test)
+        img_test = torch.from_numpy(img_test).to(self.device)
+        img_test = img_test.half() if self.half else img_test.float()  # uint8 to fp16/32
+        img_test /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if img_test.ndimension() == 3:
+            img_test = img_test.unsqueeze(0)
 
-    # Load model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
-    imgsz = check_img_size(imgsz, s=model.stride.max())  # check img_size
-    if half:
-        model.half()  # to FP16
-
-    # Second-stage classifier
-    classify = False
-    if classify:
-        modelc = load_classifier(name='resnet101', n=2)  # initialize
-        modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model'])  # load weights
-        modelc.to(device).eval()
-
-    # Set Dataloader
-    vid_path, vid_writer = None, None
-    if webcam:
-        view_img = True
-        cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz)
-    else:
-        save_img = True
-        dataset = LoadImages(source, img_size=imgsz)
-
-    # Get names and colors
-    names = model.module.names if hasattr(model, 'module') else model.names
-    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
-
-    # Run inference
-    t0 = time.time()
-    img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
-    _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-    for path, img, im0s, vid_cap in dataset:
-        img = torch.from_numpy(img).to(device)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if img.ndimension() == 3:
-            img = img.unsqueeze(0)
-
-        # Inference
+        # Inference.
         t1 = time_synchronized()
-        pred = model(img, augment=opt.augment)[0]
+        pred = self.model(img_test, augment=False)[0]
 
-        # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        # Apply NMS.
+        pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, classes=None) # filtering by class possible
         t2 = time_synchronized()
 
-        # Apply Classifier
-        if classify:
-            pred = apply_classifier(pred, modelc, img, im0s)
+        # Result format.
+        result = []
 
-        # Process detections
-        for i, det in enumerate(pred):  # detections per image
-            if webcam:  # batch_size >= 1
-                p, s, im0 = path[i], '%g: ' % i, im0s[i].copy()
-            else:
-                p, s, im0 = path, '', im0s
+        for i, det in enumerate(pred):
+            s, im0 = '', img_raw
+            s += 'Original image size: ' + '%gx%g ' % im0.shape[0:2]
+            s += ', Resized for the input layer: ' + '%gx%g ' % img_test.shape[2:]
+            s += ', Detection result: '
 
-            save_path = str(Path(out) / Path(p).name)
-            txt_path = str(Path(out) / Path(p).stem) + ('_%g' % dataset.frame if dataset.mode == 'video' else '')
-            s += '%gx%g ' % img.shape[2:]  # print string
-            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                # Rescale boxes from input layer size to original image size.
+                det[:, :4] = scale_coords(img_test.shape[2:], det[:, :4], im0.shape).round()
 
-                # Print results
+                # Print results.
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
-                    s += '%g %ss, ' % (n, names[int(c)])  # add to string
+                    s += '%g %ss, ' % (n, self.names[int(c)])  # add to string
 
-                # Write results
-                for *xyxy, conf, cls in reversed(det):
-                    if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, conf, *xywh) if opt.save_conf else (cls, *xywh)  # label format
-                        with open(txt_path + '.txt', 'a') as f:
-                            f.write(('%g ' * len(line) + '\n') % line)
-
-                    if save_img or view_img:  # Add bbox to image
-                        label = '%s %.2f' % (names[int(cls)], conf)
-                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
-
+                # Write results.
+                for *xyxy, conf, clss in reversed(det):
+                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4))).view(-1).tolist()
+                    result += [[clss.tolist(), conf.tolist(), *xywh]]  # output format list of list
+            
             # Print time (inference + NMS)
             print('%sDone. (%.3fs)' % (s, t2 - t1))
-
-            # Stream results
-            if view_img:
-                cv2.imshow(p, im0)
-                if cv2.waitKey(1) == ord('q'):  # q to quit
-                    raise StopIteration
-
-            # Save results (image with detections)
-            if save_img:
-                if dataset.mode == 'images':
-                    cv2.imwrite(save_path, im0)
-                else:
-                    if vid_path != save_path:  # new video
-                        vid_path = save_path
-                        if isinstance(vid_writer, cv2.VideoWriter):
-                            vid_writer.release()  # release previous video writer
-
-                        fourcc = 'mp4v'  # output video codec
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h))
-                    vid_writer.write(im0)
-
-    if save_txt or save_img:
-        print('Results saved to %s' % Path(out))
-
-    print('Done. (%.3fs)' % (time.time() - t0))
+        return np.array(result)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
-    parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
-    parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--view-img', action='store_true', help='display results')
-    parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
-    parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
-    parser.add_argument('--save-dir', type=str, default='inference/output', help='directory to save results')
-    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --class 0, or --class 0 2 3')
-    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
-    parser.add_argument('--augment', action='store_true', help='augmented inference')
-    parser.add_argument('--update', action='store_true', help='update all models')
-    opt = parser.parse_args()
-    print(opt)
+    def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True):
+        # Resize image to a 32-pixel-multiple rectangle https://github.com/ultralytics/yolov3/issues/232
+        shape = img.shape[:2]  # current shape [height, width]
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
 
-    with torch.no_grad():
-        if opt.update:  # update all models (to fix SourceChangeWarning)
-            for opt.weights in ['yolov5s.pt', 'yolov5m.pt', 'yolov5l.pt', 'yolov5x.pt']:
-                detect()
-                strip_optimizer(opt.weights)
-        else:
-            detect()
+        # Scale ratio (new / old)
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if not scaleup:  # only scale down, do not scale up (for better test mAP)
+            r = min(r, 1.0)
+
+        # Compute padding
+        ratio = r, r  # width, height ratios
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+        if auto:  # minimum rectangle
+            dw, dh = np.mod(dw, 32), np.mod(dh, 32)  # wh padding
+        elif scaleFill:  # stretch
+            dw, dh = 0.0, 0.0
+            new_unpad = (new_shape[1], new_shape[0])
+            ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
+
+        dw /= 2  # divide padding into 2 sides
+        dh /= 2
+
+        if shape[::-1] != new_unpad:  # resize
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
+        return img, ratio, (dw, dh)
